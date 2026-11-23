@@ -137,11 +137,20 @@ var lastArgument = window.process.argv[length-1]
 	 //  enav.newTab(clipboardStr);
 	  
 	//}
+	// Приоритет открытия первой вкладки:
+	//   1) локальный .swf, переданный аргументом командной строки (см. выше);
+	//   2) домашняя страница из настроек пользователя (store.get('homepage'));
+	//   3) жёсткий фолбэк ниже.
 	else if(home){
 		//console.log("WE HAGE CUSTOM HOMEPAGE" + home);
 		enav.newTab(home, {icon: "icons/restore-w-24.png"})}
 	else{
-		enav.newTab('https://search.flash.pm/', {icon: "clear"});
+		// Фолбэк на случай, когда в файле настроек ещё нет ключа homepage
+		// (например, профиль создан старой версией приложения).
+		// Здесь открываем PlantVisorPRO напрямую — адрес должен совпадать с
+		// PLANTVISOR_HOME_URL из index.js. Завершающий слэш обязателен:
+		// сервер делает редирект на версию со слэшем, без него лишний переход.
+		enav.newTab('https://192.168.2.26/PlantVisorPRO/', {icon: "clear"});
 		}
 		
 	

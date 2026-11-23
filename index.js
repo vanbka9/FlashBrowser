@@ -21,6 +21,30 @@ contextMenu({
 
 let mainWindow;
 
+// ============================================================================
+// НАСТРОЙКИ ПОД КОНКРЕТНУЮ ИНСТАЛЛЯЦИЮ PlantVisorPRO
+// ============================================================================
+// Зачем этот блок нужен:
+//   Страницы PlantVisorPRO подключают стили по фиксированному адресу
+//   `stylesheet/plantVisor.css`, но сервер на него отвечает 404 (соседний
+//   `keyboard.css` из того же каталога при этом отдаётся нормально, т.е. дело
+//   не в правах). Без стилей все HTML-страницы приложения (карточка устройства,
+//   таблицы параметров, «Активные тревоги», вкладки) рендерятся «голым текстом»:
+//   разметка есть, оформления нет. Было ли так всегда или файл убрали — неизвестно.
+//
+//   На сервере есть рабочий вариант стилей `plantVisorFF.css` (45 КБ, те же
+//   классы: itemPVPRO2, itemHeadPVPRO2, .bbk, .Menu_Head и т.д.) — его и
+//   подставляем вместо того, который не отдаётся.
+//
+// Если сервер начнёт отдавать plantVisor.css (или ссылки в JSP поправят),
+// обходной путь можно удалить: константы ниже, инъекцию стилей и подмену
+// домашней страницы.
+const PLANTVISOR_ORIGIN = 'https://192.168.2.26'; // адрес сервера PlantVisorPRO
+// Домашняя страница: именно её приложение открывает при старте.
+const PLANTVISOR_HOME_URL = `${PLANTVISOR_ORIGIN}/PlantVisorPRO/`;
+// Рабочий файл стилей с тем же набором классов, которым заменяем plantVisor.css.
+const PLANTVISOR_WORKING_CSS = `${PLANTVISOR_ORIGIN}/PlantVisorPRO/stylesheet/plantVisorFF.css`;
+
 let pluginName = null; //put the right flash plugin in depending on the operating system.
 switch (process.platform) {
 	case 'win32':
@@ -93,7 +117,12 @@ let sendWindow = (identifier, message) => {
 const store = new Store({
   configName: 'user-preferences',
   defaults: {
-    windowBounds: { width: 1280, height: 720, max:false }
+    windowBounds: { width: 1280, height: 720, max:false },
+    // Домашняя страница. Значение из defaults применяется только когда файла
+    // настроек ещё нет (первый запуск) или он повреждён. Если профиль уже
+    // существует, приложение возьмёт homepage оттуда — поэтому дополнительно
+    // есть фолбэк в browser.html.
+    homepage: PLANTVISOR_HOME_URL
   }
 });
 
@@ -104,6 +133,91 @@ process.on('uncaughtException', (error) => {
 
 process.on('unhandledRejection', (reason, promise) => {
 	console.error('UNHANDLED REJECTION:', reason);
+});
+
+// ============================================================================
+// ПОДСТАНОВКА РАБОЧЕГО СТИЛЯ ВМЕСТО plantVisor.css
+// ============================================================================
+// Идея: PlantVisorPRO открывается в <webview>, а тот, в свою очередь, грузит
+// страницу с frameset'ом (header, TabMenu, меню снизу и контентный фрейм).
+// Каждый из этих фреймов в своём HTML содержит ссылку
+//   <link rel="stylesheet" href="stylesheet/plantVisor.css">
+// на которую сервер отвечает 404. Мы не можем поправить сервер,
+// поэтому при каждой загрузке страницы обходим все её фреймы и добавляем в
+// каждый ещё одну ссылку — уже на рабочий plantVisorFF.css.
+//
+// Почему именно так, а не через webRequest.onBeforeRequest с редиректом:
+//   в этой сборке Electron <webview> живёт в собственной сессии, и перехватчик,
+//   повешенный на сессию главного окна, не видит его запросов (проверял —
+//   обработчик не вызывался ни разу). А вот executeJavaScript в контексте
+//   самого webview работает стабильно.
+//
+// Событие 'web-contents-created' срабатывает в главном процессе на каждый
+// созданный webContents — включая webview, который создаёт electron-navigation
+// при открытии вкладки.
+app.on('web-contents-created', (_event, contents) => {
+	// Нас интересуют только гостевые webview (сама оболочка browser.html —
+	// это тоже webContents, но с типом 'window', её стили трогать не нужно).
+	if (contents.getType() !== 'webview') return;
+
+	// Функция добавляет <link> со стилями во все документы и вложенные фреймы.
+	const injectPlantVisorCss = () => {
+		// Код выполняется ВНУТРИ страницы (в renderer-процессе) и работает с DOM
+		// напрямую; результат наружу не нужен.
+		const code = `(() => {
+			// Работаем только на сервере PlantVisorPRO: во вкладках могут быть
+			// и другие сайты (flash.pm и т.п.), им наш стиль не нужен —
+			// иначе браузер зря дёргал бы несуществующий файл на чужом хосте.
+			if (location.origin !== ${JSON.stringify(PLANTVISOR_ORIGIN)}) return;
+			// Адрес рабочего файла стилей. Значение подставляется из константы
+			// PLANTVISOR_WORKING_CSS при сборке строки (JSON.stringify
+			// экранирует кавычки, чтобы код остался валидным).
+			const href = ${JSON.stringify(PLANTVISOR_WORKING_CSS)};
+			// Рекурсивный обход: window -> его document -> все его фреймы.
+			function walk(win) {
+				let doc;
+				// Доступ к document чужого (cross-origin) фрейма бросит исключение.
+				// Для PlantVisorPRO все фреймы свои, но обёртка нужна на всякий случай.
+				try { doc = win.document; } catch (e) { return; }
+
+				try {
+					// Проверяем, не вставили ли мы уже этот стиль в данный фрейм:
+					// событий загрузки бывает несколько (did-finish-load,
+					// did-frame-finish-load, did-stop-loading), и без проверки
+					// в <head> накопились бы дубликаты.
+					if (!doc.querySelector('link[data-pvff]')) {
+						// Создаём элемент <link rel="stylesheet" ...>.
+						const link = doc.createElement('link');
+						link.rel = 'stylesheet';       // тип ресурса — стили
+						link.href = href;              // адрес plantVisorFF.css
+						link.setAttribute('data-pvff', '1'); // метка «наш» для проверки выше
+						// Вставляем в <head>, а если его нет — в корень документа.
+						(doc.head || doc.documentElement).appendChild(link);
+					}
+				} catch (e) {
+					// Битый/ещё не готовый документ — молча пропускаем,
+					// следующее событие загрузки попробует снова.
+				}
+
+				// Рекурсивно обрабатываем вложенные фреймы (у PlantVisor их до 10).
+				for (let i = 0; i < win.frames.length; i++) walk(win.frames[i]);
+			}
+
+			walk(window); // стартуем с текущего окна webview
+		})()`;
+
+		// executeJavaScript выполняет строку в гостевой странице и возвращает
+		// Promise с результатом. .catch(() => {}) нужен, чтобы падение
+		// инъекции (например, страница уже закрывается) не валило приложение.
+		contents.executeJavaScript(code).catch(() => {});
+	};
+
+	// Фреймы PlantVisorPRO появляются не сразу: сначала грузится логин-страница,
+	// и только после входа — frameset с вкладками и картой. Поэтому инъекцию
+	// вешаем на все события, которые означают «что-то догрузилось»:
+	contents.on('did-finish-load', injectPlantVisorCss);      // основной документ загружен
+	contents.on('did-frame-finish-load', injectPlantVisorCss); // загрузился отдельный фрейм
+	contents.on('did-stop-loading', injectPlantVisorCss);      // страница полностью успокоилась
 });
 
 app.on('ready',   () => {
